@@ -1,349 +1,207 @@
-import psycopg2
-from config import DB_CONFIG
-import random
+from sqlalchemy import create_engine, Column, Integer, String, BigInteger, Boolean, DateTime, Text, DECIMAL, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.sql import func
+from datetime import datetime
+import os
+
+# Базовый класс для моделей
+Base = declarative_base()
 
 
-class Database:
-    def __init__(self):
-        self._connection = None
-        self._connect()
-        if self._is_connected():
-            self._create_tables()
-            self._insert_common_words()
-        else:
-            print("WARNING: Database connection failed")
+# Модели БД
+class User(Base):
+    __tablename__ = 'users'
 
-    def _connect(self):
-        """Устанавливает соединение с базой данных"""
-        try:
-            self._connection = psycopg2.connect(**DB_CONFIG)
-            self._connection.autocommit = False
-            print("✓ Connected to PostgreSQL database successfully")
-        except Exception as e:
-            print(f"✗ Error connecting to database: {e}")
-            self._connection = None
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    username = Column(String(100))
+    first_name = Column(String(100))
+    last_name = Column(String(100))
+    subscription_type = Column(String(50), default='free')
+    balance = Column(DECIMAL(10, 2), default=0.00)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
-    def _is_connected(self):
-        """Проверяет, активно ли соединение"""
-        return self._connection is not None and not self._connection.closed
+    # Связь с другими таблицами
+    requests = relationship("UserRequest", back_populates="user")
+    payments = relationship("Payment", back_populates="user")
 
-    def _ensure_connection(self):
-        """Убеждается, что соединение активно"""
-        if not self._is_connected():
-            self._connect()
-        return self._is_connected()
 
-    def _create_tables(self):
-        """Создает таблицы в базе данных"""
-        if not self._ensure_connection():
-            return False
+class UserRequest(Base):
+    __tablename__ = 'user_requests'
 
-        commands = [
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username VARCHAR(100),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS words (
-                word_id SERIAL PRIMARY KEY,
-                english_word VARCHAR(100) NOT NULL,
-                russian_translation VARCHAR(100) NOT NULL,
-                is_common BOOLEAN DEFAULT FALSE,
-                UNIQUE(english_word, russian_translation)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS user_words (
-                user_word_id SERIAL PRIMARY KEY,
-                user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
-                word_id INTEGER REFERENCES words(word_id) ON DELETE CASCADE,
-                is_active BOOLEAN DEFAULT TRUE,
-                UNIQUE(user_id, word_id)
-            )
-            """
-        ]
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    provider = Column(String(50))
+    query = Column(Text)
+    response_time = Column(Integer)
+    success = Column(Boolean, default=True)
+    error_message = Column(Text)
+    created_at = Column(DateTime, default=func.now())
 
-        try:
-            cursor = self._connection.cursor()
-            for command in commands:
-                cursor.execute(command)
-            self._connection.commit()
-            cursor.close()
-            print("✓ Tables created successfully")
-            return True
-        except Exception as e:
-            print(f"✗ Error creating tables: {e}")
-            if self._is_connected():
-                self._connection.rollback()
-            return False
+    # Связь с пользователем
+    user = relationship("User", back_populates="requests")
 
-    def _insert_common_words(self):
-        """Добавляет общие слова в базу данных"""
-        if not self._ensure_connection():
-            return False
 
-        common_words = [
-            ('Peace', 'Мир'),
-            ('Green', 'Зеленый'),
-            ('White', 'Белый'),
-            ('Hello', 'Привет'),
-            ('Car', 'Машина'),
-            ('House', 'Дом'),
-            ('Book', 'Книга'),
-            ('Water', 'Вода'),
-            ('Sun', 'Солнце'),
-            ('Tree', 'Дерево')
-        ]
+class Payment(Base):
+    __tablename__ = 'payments'
 
-        try:
-            cursor = self._connection.cursor()
-            cursor.execute("SELECT COUNT(*) FROM words WHERE is_common = TRUE")
-            count = cursor.fetchone()[0]
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    amount = Column(DECIMAL(10, 2))
+    currency = Column(String(10), default='RUB')
+    status = Column(String(20), default='pending')
+    provider = Column(String(50))
+    payment_id = Column(String(100))
+    created_at = Column(DateTime, default=func.now())
 
-            if count == 0:
-                for eng_word, rus_word in common_words:
-                    try:
-                        cursor.execute(
-                            """INSERT INTO words (english_word, russian_translation, is_common) 
-                               VALUES (%s, %s, %s)""",
-                            (eng_word, rus_word, True)
-                        )
-                    except psycopg2.IntegrityError:
-                        # Слово уже существует, пропускаем
-                        self._connection.rollback()
-                        continue
+    # Связь с пользователем
+    user = relationship("User", back_populates="payments")
 
-                self._connection.commit()
-                print(f"✓ Common words inserted successfully")
+
+class DatabaseManager:
+    def __init__(self, database_url=None):
+        self.database_url = database_url or os.getenv('DATABASE_URL', 'postgresql://user:pass@localhost/bot_db')
+        self.engine = create_engine(self.database_url)
+        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+
+        # Создаем таблицы
+        self.create_tables()
+
+    def create_tables(self):
+        """Создает все таблицы если они не существуют"""
+        Base.metadata.create_all(bind=self.engine)
+
+    def get_session(self):
+        """Возвращает сессию БД"""
+        return self.SessionLocal()
+
+    # Оптимизированные методы для работы с пользователями
+    def get_or_create_user(self, telegram_id, username=None, first_name=None, last_name=None):
+        """Получает или создает пользователя ОДНИМ запросом"""
+        with self.get_session() as session:
+            user = session.query(User).filter(User.telegram_id == telegram_id).first()
+
+            if not user:
+                user = User(
+                    telegram_id=telegram_id,
+                    username=username,
+                    first_name=first_name,
+                    last_name=last_name
+                )
+                session.add(user)
+                session.commit()
+                session.refresh(user)
             else:
-                print(f"✓ Common words already exist ({count} words)")
+                # Обновляем данные если нужно
+                if any([username != user.username, first_name != user.first_name, last_name != user.last_name]):
+                    user.username = username
+                    user.first_name = first_name
+                    user.last_name = last_name
+                    session.commit()
 
-            cursor.close()
-            return True
-        except Exception as e:
-            print(f"✗ Error inserting common words: {e}")
-            if self._is_connected():
-                self._connection.rollback()
-            return False
+            return user
 
-    def add_user(self, user_id, username):
-        """Добавляет пользователя в базу данных"""
-        if not self._ensure_connection():
-            return False
+    def log_user_request(self, telegram_id, provider, query, response_time, success=True, error_message=None):
+        """Логирует запрос пользователя ОДНИМ запросом с JOIN"""
+        with self.get_session() as session:
+            # Находим пользователя и создаем запрос в одном запросе
+            user = session.query(User).filter(User.telegram_id == telegram_id).first()
 
-        try:
-            cursor = self._connection.cursor()
-            cursor.execute(
-                """INSERT INTO users (user_id, username) 
-                   VALUES (%s, %s) 
-                   ON CONFLICT (user_id) DO NOTHING""",
-                (user_id, username)
-            )
-            self._connection.commit()
-            cursor.close()
-            return True
-        except Exception as e:
-            print(f"✗ Error adding user {user_id}: {e}")
-            if self._is_connected():
-                self._connection.rollback()
-            return False
+            if user:
+                request = UserRequest(
+                    user_id=user.id,
+                    provider=provider,
+                    query=query,
+                    response_time=response_time,
+                    success=success,
+                    error_message=error_message
+                )
+                session.add(request)
+                session.commit()
 
-    def get_random_word(self, user_id):
-        """Получает случайное слово для пользователя"""
-        if not self._ensure_connection():
-            return None
+    # Оптимизированные методы для аналитики
+    def get_user_stats(self, days=7):
+        """Получает статистику пользователей за указанный период ОДНИМ запросом"""
+        with self.get_session() as session:
+            from sqlalchemy import and_
 
-        try:
-            cursor = self._connection.cursor()
+            cutoff_date = datetime.now() - timedelta(days=days)
 
-            cursor.execute("""
-                SELECT w.word_id, w.english_word, w.russian_translation 
-                FROM words w
-                LEFT JOIN user_words uw ON w.word_id = uw.word_id AND uw.user_id = %s
-                WHERE (w.is_common = TRUE OR (uw.user_id = %s AND uw.is_active = TRUE))
-                AND (uw.is_active IS NULL OR uw.is_active = TRUE)
-                ORDER BY RANDOM()
-                LIMIT 1
-            """, (user_id, user_id))
+            stats = session.query(
+                func.count(User.id).label('total_users'),
+                func.count(UserRequest.id).label('total_requests'),
+                func.avg(UserRequest.response_time).label('avg_response_time')
+            ).outerjoin(
+                UserRequest, and_(
+                    User.id == UserRequest.user_id,
+                    UserRequest.created_at >= cutoff_date
+                )
+            ).first()
 
-            result = cursor.fetchone()
-            cursor.close()
+            return {
+                'total_users': stats.total_users,
+                'total_requests': stats.total_requests or 0,
+                'avg_response_time': float(stats.avg_response_time or 0)
+            }
 
-            if result:
-                return {
-                    'word_id': result[0],
-                    'english_word': result[1],
-                    'russian_translation': result[2]
+    def get_recent_activity(self, limit=20):
+        """Получает последние действия пользователей ОДНИМ запросом с JOIN"""
+        with self.get_session() as session:
+            activities = session.query(
+                UserRequest,
+                User
+            ).join(
+                User, UserRequest.user_id == User.id
+            ).order_by(
+                UserRequest.created_at.desc()
+            ).limit(limit).all()
+
+            return [
+                {
+                    'user': user,
+                    'request': request,
+                    'timestamp': request.created_at
                 }
-            return None
+                for request, user in activities
+            ]
 
-        except Exception as e:
-            print(f"✗ Error getting random word: {e}")
-            return None
+    def get_user_activity_report(self, telegram_id, days=30):
+        """Получает полный отчет по активности пользователя ОДНИМ запросом"""
+        with self.get_session() as session:
+            from sqlalchemy import and_, func
 
-    def get_wrong_options(self, correct_word_id, user_id, limit=3):
-        """Получает неправильные варианты ответов"""
-        if not self._ensure_connection():
-            return []
+            cutoff_date = datetime.now() - timedelta(days=days)
 
-        try:
-            cursor = self._connection.cursor()
-            cursor.execute("""
-                SELECT english_word 
-                FROM words 
-                WHERE word_id != %s 
-                AND (is_common = TRUE OR word_id IN (
-                    SELECT word_id FROM user_words 
-                    WHERE user_id = %s AND is_active = TRUE
-                ))
-                ORDER BY RANDOM() 
-                LIMIT %s
-            """, (correct_word_id, user_id, limit))
-
-            results = cursor.fetchall()
-            cursor.close()
-
-            return [result[0] for result in results]
-
-        except Exception as e:
-            print(f"✗ Error getting wrong options: {e}")
-            return []
-
-    def add_custom_word(self, user_id, english_word, russian_translation):
-        """Добавляет пользовательское слово"""
-        if not self._ensure_connection():
-            return False
-
-        try:
-            cursor = self._connection.cursor()
-
-            # Сначала проверяем, существует ли уже такое слово
-            cursor.execute(
-                "SELECT word_id FROM words WHERE english_word = %s AND russian_translation = %s",
-                (english_word, russian_translation)
-            )
-            existing_word = cursor.fetchone()
-
-            if existing_word:
-                word_id = existing_word[0]
-                print(f"✓ Word already exists with ID: {word_id}")
-            else:
-                # Добавляем новое слово
-                cursor.execute(
-                    """INSERT INTO words (english_word, russian_translation, is_common) 
-                       VALUES (%s, %s, %s) 
-                       RETURNING word_id""",
-                    (english_word, russian_translation, False)
+            report = session.query(
+                func.count(UserRequest.id).label('total_requests'),
+                func.avg(UserRequest.response_time).label('avg_response_time'),
+                func.max(UserRequest.created_at).label('last_activity'),
+                UserRequest.provider,
+                func.count(UserRequest.provider).label('provider_count')
+            ).join(
+                User, UserRequest.user_id == User.id
+            ).filter(
+                and_(
+                    User.telegram_id == telegram_id,
+                    UserRequest.created_at >= cutoff_date
                 )
-                word_id = cursor.fetchone()[0]
-                print(f"✓ New word added with ID: {word_id}")
+            ).group_by(
+                UserRequest.provider
+            ).all()
 
-            # Связываем слово с пользователем
-            cursor.execute(
-                """INSERT INTO user_words (user_id, word_id, is_active) 
-                   VALUES (%s, %s, %s) 
-                   ON CONFLICT (user_id, word_id) 
-                   DO UPDATE SET is_active = EXCLUDED.is_active""",
-                (user_id, word_id, True)
-            )
+            return [
+                {
+                    'provider': item.provider,
+                    'request_count': item.provider_count,
+                    'avg_response_time': float(item.avg_response_time or 0),
+                    'last_activity': item.last_activity
+                }
+                for item in report
+            ]
 
-            self._connection.commit()
-            cursor.close()
-            print(f"✓ Word '{english_word}' successfully linked to user {user_id}")
-            return True
 
-        except Exception as e:
-            print(f"✗ Error adding custom word '{english_word}': {e}")
-            if self._is_connected():
-                self._connection.rollback()
-            return False
-
-    def deactivate_user_word(self, user_id, english_word):
-        """Деактивирует слово для пользователя"""
-        if not self._ensure_connection():
-            return False
-
-        try:
-            cursor = self._connection.cursor()
-
-            cursor.execute("""
-                UPDATE user_words 
-                SET is_active = FALSE 
-                WHERE user_id = %s AND word_id IN (
-                    SELECT word_id FROM words WHERE english_word = %s
-                )
-            """, (user_id, english_word))
-
-            rows_affected = cursor.rowcount
-            self._connection.commit()
-            cursor.close()
-
-            if rows_affected > 0:
-                print(f"✓ Word '{english_word}' deactivated for user {user_id}")
-            else:
-                print(f"✗ Word '{english_word}' not found for user {user_id}")
-
-            return rows_affected > 0
-
-        except Exception as e:
-            print(f"✗ Error deactivating word: {e}")
-            if self._is_connected():
-                self._connection.rollback()
-            return False
-
-    def get_user_words_count(self, user_id):
-        """Получает количество активных слов пользователя"""
-        if not self._ensure_connection():
-            return 0
-
-        try:
-            cursor = self._connection.cursor()
-
-            cursor.execute("""
-                SELECT COUNT(*) 
-                FROM user_words 
-                WHERE user_id = %s AND is_active = TRUE
-            """, (user_id,))
-
-            count = cursor.fetchone()[0]
-            cursor.close()
-
-            return count
-
-        except Exception as e:
-            print(f"✗ Error getting user words count: {e}")
-            return 0
-
-    def close(self):
-        """Закрывает соединение с базой данных"""
-        if self._is_connected():
-            self._connection.close()
-            print("✓ Database connection closed")
-
-    def get_user_active_words_count(self, user_id):
-        """Получает количество активных слов пользователя (общие + персональные)"""
-        if not self._ensure_connection():
-            return 0
-
-        try:
-            cursor = self._connection.cursor()
-
-            cursor.execute("""
-                SELECT COUNT(*) 
-                FROM words w
-                LEFT JOIN user_words uw ON w.word_id = uw.word_id AND uw.user_id = %s
-                WHERE (w.is_common = TRUE OR (uw.user_id = %s AND uw.is_active = TRUE))
-                AND (uw.is_active IS NULL OR uw.is_active = TRUE)
-            """, (user_id, user_id))
-
-            count = cursor.fetchone()[0]
-            cursor.close()
-
-            return count
-
-        except Exception as e:
-            print(f"✗ Error getting user active words count: {e}")
-            return 0
+# Глобальный экземпляр менеджера БД
+db = DatabaseManager()
